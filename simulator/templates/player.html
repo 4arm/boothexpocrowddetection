@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simulation Results</title>
+    <style>
+        body { font-family: sans-serif; background-color: #121212; color: #fff; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        .container { display: flex; max-width: 1400px; width: 100%; gap: 20px; }
+        .video-container { flex: 2; position: relative; }
+        .video-container img { width: 100%; border: 2px solid #333; border-radius: 8px; }
+        .stats-panel { flex: 1; background: #1e1e1e; padding: 20px; border-radius: 8px; overflow-y: auto; max-height: 80vh; }
+        .zone-card { border-left: 4px solid #007bff; background: #252525; margin-bottom: 15px; padding: 15px; border-radius: 4px; }
+        .zone-title { margin: 0 0 10px 0; font-size: 1.2em; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 14px; }
+        .highlight-val { color: #00ff00; font-size: 16px; font-weight:bold; }
+        .nav-link { color: #007bff; text-decoration: none; margin-bottom: 20px; display: inline-block; }
+    </style>
+</head>
+<body>
+    <a href="/" class="nav-link">&larr; Back to Simulator</a>
+    <h1>Simulation Results</h1>
+    <p>This is exactly how the AI sees and counts your overlapping simulated people.</p>
+    
+    <div class="container">
+        <div class="video-container">
+            <img src="/video_feed" id="video-stream" alt="Processing...">
+            <div id="status-msg" style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.7); padding:5px 10px; border-radius:4px; font-weight:bold;">Playing</div>
+        </div>
+        
+        <div class="stats-panel" id="stats-panel">
+            Loading stats...
+        </div>
+    </div>
+
+    <script>
+        const statsPanel = document.getElementById('stats-panel');
+        const statusMsg = document.getElementById('status-msg');
+
+        function fetchStats() {
+            fetch('/get_stats')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'finished') {
+                        statusMsg.innerText = "Simulation Complete";
+                        statusMsg.style.color = "orange";
+                    }
+
+                    statsPanel.innerHTML = '';
+                    const stats = data.stats || {};
+                    for (const [zoneName, zStats] of Object.entries(stats)) {
+                        const card = `
+                            <div class="zone-card">
+                                <h3 class="zone-title">${zoneName}</h3>
+                                <div class="stat-row"><span>People Detected:</span> <span class="highlight-val">${zStats.current}</span></div>
+                            </div>
+                        `;
+                        statsPanel.innerHTML += card;
+                    }
+                })
+                .catch(err => console.error(err));
+        }
+
+        setInterval(fetchStats, 1000);
+        fetchStats();
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Crowd Simulator</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 20px; }
+        .toolbar { margin-bottom: 20px; display: flex; gap: 10px; align-items: center; }
+        button { padding: 10px 15px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #canvas-container { position: relative; display: inline-block; border: 2px solid #444; }
+        #bg-image { display: block; max-width: 1280px; }
+        .person { position: absolute; cursor: move; user-select: none; border: 2px dashed transparent; }
+        .person:hover { border-color: #fff; }
+        .person.selected { border-color: #00ff00; }
+        .person img { width: 100%; height: 100%; pointer-events: none; }
+        .resize-handle { position: absolute; width: 10px; height: 10px; background: #00ff00; right: -5px; bottom: -5px; cursor: se-resize; display: none; }
+        .person.selected .resize-handle { display: block; }
+    </style>
+</head>
+<body>
+    <a href="/" style="color:#007bff; text-decoration:none;">&larr; Back to Upload</a>
+    <h1>Crowd Simulator</h1>
+    <p>Click "Add Person" to place a virtual person in the booth. Drag to move, drag the bottom-right corner to resize. When done, click "Run Simulation".</p>
+    
+    <div class="toolbar">
+        <button onclick="addPerson()">+ Add Person</button>
+        <button onclick="deleteSelected()" style="background: #dc3545;">Delete Selected</button>
+        <button onclick="runSimulation()" style="background: #28a745; margin-left: auto;">Run Simulation &rarr;</button>
+    </div>
+
+    <div id="canvas-container">
+        <img id="bg-image" src="/static/bg.jpg" alt="Booth Background">
+    </div>
+
+    <script>
+        const container = document.getElementById('canvas-container');
+        let personCount = 0;
+        let selectedPerson = null;
+
+        function addPerson() {
+            personCount++;
+            const el = document.createElement('div');
+            el.className = 'person';
+            el.id = 'person-' + personCount;
+            el.style.left = '500px';
+            el.style.top = '300px';
+            el.style.width = '100px';
+            el.style.height = '250px';
+            
+            const img = document.createElement('img');
+            img.src = '/static/human.png';
+            el.appendChild(img);
+            
+            const handle = document.createElement('div');
+            handle.className = 'resize-handle';
+            el.appendChild(handle);
+            
+            container.appendChild(el);
+            
+            makeDraggableAndResizable(el, handle);
+            selectPerson(el);
+        }
+
+        function selectPerson(el) {
+            if (selectedPerson) selectedPerson.classList.remove('selected');
+            selectedPerson = el;
+            if (el) el.classList.add('selected');
+        }
+
+        function deleteSelected() {
+            if (selectedPerson) {
+                selectedPerson.remove();
+                selectedPerson = null;
+            }
+        }
+
+        document.addEventListener('mousedown', (e) => {
+            if (!e.target.closest('.person') && !e.target.closest('button')) {
+                selectPerson(null);
+            }
+        });
+
+        function makeDraggableAndResizable(el, handle) {
+            let isDragging = false;
+            let isResizing = false;
+            let startX, startY, startW, startH, startLeft, startTop;
+
+            el.addEventListener('mousedown', (e) => {
+                if (e.target === handle) return;
+                e.stopPropagation();
+                selectPerson(el);
+                isDragging = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                startLeft = parseInt(el.style.left || 0, 10);
+                startTop = parseInt(el.style.top || 0, 10);
+            });
+
+            handle.addEventListener('mousedown', (e) => {
+                e.stopPropagation();
+                isResizing = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                startW = parseInt(el.style.width || 0, 10);
+                startH = parseInt(el.style.height || 0, 10);
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (isDragging) {
+                    const dx = e.clientX - startX;
+                    const dy = e.clientY - startY;
+                    el.style.left = (startLeft + dx) + 'px';
+                    el.style.top = (startTop + dy) + 'px';
+                } else if (isResizing) {
+                    const dx = e.clientX - startX;
+                    // Maintain aspect ratio 200x500 = 1:2.5
+                    const newW = Math.max(20, startW + dx);
+                    const newH = newW * 2.5;
+                    el.style.width = newW + 'px';
+                    el.style.height = newH + 'px';
+                }
+            });
+
+            document.addEventListener('mouseup', () => {
+                isDragging = false;
+                isResizing = false;
+            });
+        }
+
+        function runSimulation() {
+            const bgImg = document.getElementById('bg-image');
+            const bgRect = bgImg.getBoundingClientRect();
+            
+            // Collect people coordinates relative to the original background size
+            // The displayed background might be scaled, so we calculate the ratio
+            // But we hardcoded max-width 1280, the native is 1280x720, so ratio is 1 if screen is large enough.
+            const ratioX = 1280 / bgRect.width;
+            const ratioY = 720 / bgRect.height;
+            
+            const people = [];
+            document.querySelectorAll('.person').forEach(el => {
+                const rect = el.getBoundingClientRect();
+                people.push({
+                    x: (rect.left - bgRect.left) * ratioX,
+                    y: (rect.top - bgRect.top) * ratioY,
+                    w: rect.width * ratioX,
+                    h: rect.height * ratioY
+                });
+            });
+
+            const btn = document.querySelector('button[onclick="runSimulation()"]');
+            btn.innerText = "Generating Video...";
+            btn.disabled = true;
+
+            fetch('/api/simulate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ people: people })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.success) {
+                    window.location.href = '/player';
+                } else {
+                    alert("Error: " + data.error);
+                    btn.innerText = "Run Simulation &rarr;";
+                    btn.disabled = false;
+                }
+            })
+            .catch(err => {
+                console.error(err);
+                btn.innerText = "Run Simulation &rarr;";
+                btn.disabled = false;
+            });
+        }
+    </script>
+</body>
+</html>
+

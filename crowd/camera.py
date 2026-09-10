@@ -24,10 +24,137 @@ from settings import INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET, CAMERA
 os.environ["GST_DEBUG"] = "0"
 
 # JPEG encode throttle – minimum seconds between encodes (~15 fps).
-# Detection/tracking still runs at full pipeline rate.
 _JPEG_MIN_INTERVAL = 1.0 / 15
 
 
+# ==================================================================
+# Appearance-Based ReID (Color Histogram)
+# ==================================================================
+class AppearanceReID:
+    """Lightweight re-identification using upper-body HSV color histograms.
+
+    When the tracker assigns a new ID to someone who was recently lost,
+    this module compares clothing color to a gallery of lost tracks and
+    merges them if the appearance matches — even if the bounding box
+    changed from head-only to full-body or the person moved.
+
+    Flow:
+        track_history  ──(lost >3s)──►  gallery  ──(expired >30s)──►  InfluxDB
+                                           ▲ match
+                             new detection ─┘
+    """
+
+    def __init__(self, match_threshold=0.55, gallery_ttl=30.0):
+        self.match_threshold = match_threshold
+        self.gallery_ttl = gallery_ttl          # seconds to keep lost tracks
+        self.gallery = {}                       # old_id -> {hist, track, time}
+
+    # ----- feature extraction -----
+
+    def extract(self, frame_rgb, x1, y1, x2, y2, frame_w, frame_h, target_w, target_h):
+        """Extract a 16×16 HSV histogram from the upper-body crop.
+
+        Coordinates (x1 … y2) are in *target* space (1280×720).  The crop is
+        taken from the original-resolution RGB frame for higher quality.
+        """
+        sx = frame_w / target_w
+        sy = frame_h / target_h
+        ox1 = max(0, int(x1 * sx))
+        oy1 = max(0, int(y1 * sy))
+        ox2 = min(frame_w, int(x2 * sx))
+        oy2 = min(frame_h, int(y2 * sy))
+
+        h = oy2 - oy1
+        w = ox2 - ox1
+        if h < 8 or w < 8:
+            return None
+
+        # Upper 50 % of bbox = head + torso (most colour-distinctive)
+        crop = frame_rgb[oy1:oy1 + int(h * 0.5), ox1:ox2]
+        if crop.size == 0:
+            return None
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
+
+    @staticmethod
+    def blend(old_hist, new_hist, alpha=0.15):
+        """Exponential moving average so the feature adapts slowly."""
+        if old_hist is None:
+            return new_hist
+        if new_hist is None:
+            return old_hist
+        return (1.0 - alpha) * old_hist + alpha * new_hist
+
+    # ----- gallery management -----
+
+    def save(self, track_id, histogram, track_data, timestamp):
+        """Add a lost track to the gallery for future matching."""
+        if histogram is None:
+            return
+        self.gallery[track_id] = {
+            "hist": histogram.copy(),
+            "track": {
+                "dwells":     track_data["dwells"].copy(),
+                "dom_zone":   track_data["dom_zone"],
+                "dom_class":  track_data["dom_class"],
+            },
+            "time": timestamp,
+        }
+
+    def match(self, histogram, current_time):
+        """Find the best gallery match for *histogram*.
+
+        Returns (gallery_id, score) or (None, 0.0).
+        Rejects ambiguous matches where 2nd-best is ≥ 85 % of 1st-best.
+        """
+        if histogram is None:
+            return None, 0.0
+
+        candidates = []
+        for gid, entry in self.gallery.items():
+            if current_time - entry["time"] > self.gallery_ttl:
+                continue
+            score = cv2.compareHist(histogram, entry["hist"], cv2.HISTCMP_CORREL)
+            candidates.append((gid, score))
+
+        if not candidates:
+            return None, 0.0
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_id, best_score = candidates[0]
+
+        if best_score < self.match_threshold:
+            return None, 0.0
+
+        # Ambiguity guard: reject if two gallery entries look very similar
+        if len(candidates) > 1 and candidates[1][1] >= best_score * 0.85:
+            return None, 0.0
+
+        return best_id, best_score
+
+    def pop(self, track_id):
+        """Remove and return a gallery entry."""
+        return self.gallery.pop(track_id, None)
+
+    def flush_expired(self, current_time):
+        """Remove expired entries; return their track dicts for InfluxDB."""
+        expired_tracks = []
+        to_remove = []
+        for gid, entry in self.gallery.items():
+            if current_time - entry["time"] > self.gallery_ttl:
+                expired_tracks.append(entry["track"])
+                to_remove.append(gid)
+        for gid in to_remove:
+            del self.gallery[gid]
+        return expired_tracks
+
+
+# ==================================================================
+# Hailo GStreamer Pipeline Wrapper
+# ==================================================================
 class HailoVideoApp(GStreamerPoseEstimationApp):
     def __init__(self, callback, user_data, source_url):
         self.source_url = source_url
@@ -59,6 +186,16 @@ class HailoVideoApp(GStreamerPoseEstimationApp):
     def get_pipeline_string(self):
         pipeline = super().get_pipeline_string()
         pipeline = pipeline.replace("vdevice-group-id=1", "vdevice-group-id=1 multi-process-service=true")
+        
+        # Enhance tracking robustness: remember lost people for 30 frames (1 second) 
+        # instead of the default 2 frames, to prevent ID flickering.
+        pipeline = pipeline.replace("keep-lost-frames=2", "keep-lost-frames=30")
+        
+        # Lower the extremely strict Intersection-over-Union thresholds (0.9 -> 0.5) 
+        # so the tracker doesn't drop the ID when overlapping people change shape slightly
+        pipeline = pipeline.replace("iou-thr=0.9", "iou-thr=0.5")
+        pipeline = pipeline.replace("init-iou-thr=0.7", "init-iou-thr=0.5")
+        
         pipeline = pipeline.replace("rtspsrc", "rtspsrc ntp-sync=true add-reference-timestamp-meta=true protocols=tcp latency=100")
         pipeline = pipeline.replace('caps="video/x-raw, framerate=30/1"', 'caps="video/x-raw"', 1)
         pipeline = pipeline.replace("video-sink=autovideosink", "video-sink=fakesink", 1)
@@ -70,6 +207,9 @@ class UserData(app_callback_class):
         super().__init__()
 
 
+# ==================================================================
+# Main Video Camera / Tracker
+# ==================================================================
 class VideoCamera:
     def __init__(self, source):
         self.source = source
@@ -84,6 +224,9 @@ class VideoCamera:
         self.last_active_ids = set()
         self._stats_lock = threading.Lock()
 
+        # Appearance-based ReID
+        self.reid = AppearanceReID(match_threshold=0.55, gallery_ttl=30.0)
+
         self.load_config()
 
         # Shared frame buffers for Flask streaming
@@ -92,7 +235,7 @@ class VideoCamera:
         self.stopped = False
         self._last_encode_time = 0.0
 
-        # Initialize InfluxDB with batched writes (no manual queue needed)
+        # Initialize InfluxDB with batched writes
         try:
             self.influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
             self.write_api = self.influx_client.write_api(
@@ -183,13 +326,13 @@ class VideoCamera:
         roi = hailo.get_roi_from_buffer(buffer)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
+        # current_frame_data values:
+        #   (foot_x, foot_y, zone, x1, y1, x2, y2, histogram)
         current_frame_data = {}
 
         for det in detections:
-            if det.get_label() != "person":
-                continue
-            if det.get_confidence() < 0.3:
-                continue
+            if det.get_label() != "person": continue
+            if det.get_confidence() < 0.15: continue
             uid = det.get_objects_typed(hailo.HAILO_UNIQUE_ID)
             if len(uid) != 1:
                 continue
@@ -200,43 +343,47 @@ class VideoCamera:
             x2 = int((bbox.xmin() + bbox.width()) * self.width)
             y2 = int((bbox.ymin() + bbox.height()) * self.height)
 
-            foot_x, foot_y = int((x1 + x2) / 2), y2
-            landmarks = det.get_objects_typed(hailo.HAILO_LANDMARKS)
-            if landmarks:
-                pts = landmarks[0].get_points()
-                if len(pts) >= 17:
-                    la, ra = pts[15], pts[16]
-                    visible = []
-                    # Hailo keypoint confidence uses a different convention
-                    # than detection confidence — low values indicate usable
-                    # ankle positions for foot placement.
-                    if la.confidence() < 0.3:
-                        visible.append((int(la.x() * self.width), int(la.y() * self.height)))
-                    if ra.confidence() < 0.3:
-                        visible.append((int(ra.x() * self.width), int(ra.y() * self.height)))
-                    if visible:
-                        foot_x = int(sum(p[0] for p in visible) / len(visible))
-                        foot_y = int(sum(p[1] for p in visible) / len(visible))
+            # --- IMPROVED: Spatial Smoothing for Zone Detection ---
+            # Instead of one point, check left-bottom, center-bottom, and right-bottom
+            # This prevents a tiny shift in the bbox from kicking the person out of the zone.
+            test_points = [
+                (x1, y2),                  # Bottom Left
+                (int((x1 + x2) / 2), y2),  # Bottom Center
+                (x2, y2)                   # Bottom Right
+            ]
 
             current_phys_zone = None
             for z_name, contour in self.zones.items():
-                if cv2.pointPolygonTest(contour, (foot_x, foot_y), False) >= 0:
-                    current_phys_zone = z_name
-                    break
+                for pt in test_points:
+                    if cv2.pointPolygonTest(contour, pt, False) >= 0:
+                        current_phys_zone = z_name
+                        break
+                if current_phys_zone: break
 
             if current_phys_zone is not None:
-                current_frame_data[uid[0].get_id()] = (foot_x, foot_y, current_phys_zone, x1, y1, x2, y2)
+                foot_x, foot_y = int((x1 + x2) / 2), y2
+                # Extract appearance feature for ReID
+                hist = self.reid.extract(
+                    frame, x1, y1, x2, y2,
+                    width, height, self.width, self.height
+                )
+                current_frame_data[uid[0].get_id()] = (
+                    foot_x, foot_y, current_phys_zone,
+                    x1, y1, x2, y2, hist
+                )
 
         current_active_ids = set(current_frame_data.keys())
 
-        # ID Merging Logic
-        revised_ids = [tid for tid in current_active_ids if tid not in self.last_active_ids and tid in self.track_history]
+        # ----------------------------------------------------------
+        # Stage 1: Spatial merge (fast, for nearby ID re-assignments)
+        # ----------------------------------------------------------
+        revised_ids = [tid for tid in current_active_ids
+                       if tid not in self.last_active_ids and tid in self.track_history]
         lost_ids = [tid for tid in self.track_history if tid not in current_active_ids]
 
-        # --- Critical section: protect zone_stats from Flask reader ---
         with self._stats_lock:
             for rev_id in revised_ids:
-                rev_cx, rev_cy, _, _, _, _, _ = current_frame_data[rev_id]
+                rev_cx, rev_cy, _, _, _, _, _, _ = current_frame_data[rev_id]
                 for lost_id in lost_ids:
                     last_x, last_y = self.track_history[lost_id]["path"][-1]
                     if np.sqrt((rev_cx - last_x)**2 + (rev_cy - last_y)**2) < 150:
@@ -252,28 +399,69 @@ class VideoCamera:
                         for z, d_time in lost_track["dwells"].items():
                             self.track_history[rev_id]["dwells"][z] = self.track_history[rev_id]["dwells"].get(z, 0) + d_time
 
+                        # Carry over appearance feature
+                        if "histogram" in lost_track and lost_track["histogram"] is not None:
+                            self.track_history[rev_id]["histogram"] = lost_track["histogram"]
+
                         del self.track_history[lost_id]
                         lost_ids.remove(lost_id)
                         break
 
             self.last_active_ids = current_active_ids
 
-            # Normal Tracking Loop
-            for track_id, (cx, cy, current_phys_zone, x1, y1, x2, y2) in current_frame_data.items():
+            # ----------------------------------------------------------
+            # Stage 2: Normal Tracking Loop + ReID gallery matching
+            # ----------------------------------------------------------
+            for track_id, (cx, cy, current_phys_zone, x1, y1, x2, y2, hist) in current_frame_data.items():
                 if track_id not in self.track_history:
-                    self.track_history[track_id] = {
-                        "last_update": current_time,
-                        "last_seen": current_time,
-                        "dwells": {current_phys_zone: 0.1},
-                        "phys_zone": current_phys_zone,
-                        "dom_zone": current_phys_zone,
-                        "dom_class": "crowd_1",
-                        "path": [(cx, cy)]
-                    }
-                    self.zone_stats[current_phys_zone]["current"] += 1
-                    self.zone_stats[current_phys_zone]["total"] += 1
-                    self.zone_stats[current_phys_zone]["crowd_1"] += 1
+                    # --- New ID detected in a zone ---
+
+                    # Try appearance-based ReID against gallery
+                    match_id, match_score = self.reid.match(hist, current_time)
+
+                    if match_id is not None:
+                        # *** ReID match found — restore lost track ***
+                        gallery_entry = self.reid.pop(match_id)
+                        gallery_track = gallery_entry["track"]
+
+                        merged_dwells = gallery_track["dwells"].copy()
+                        if current_phys_zone in merged_dwells:
+                            merged_dwells[current_phys_zone] += 0.1
+                        else:
+                            merged_dwells[current_phys_zone] = 0.1
+
+                        self.track_history[track_id] = {
+                            "last_update": current_time,
+                            "last_seen": current_time,
+                            "dwells": merged_dwells,
+                            "phys_zone": current_phys_zone,
+                            "dom_zone": gallery_track["dom_zone"],
+                            "dom_class": gallery_track["dom_class"],
+                            "histogram": hist,
+                            "path": [(cx, cy)]
+                        }
+                        # Only restore live count (total & crowd_X already counted)
+                        self.zone_stats[current_phys_zone]["current"] += 1
+                        print(f"[reid] Matched new ID {track_id} → lost gallery (score={match_score:.2f})")
+
+                    else:
+                        # Genuinely new person
+                        self.track_history[track_id] = {
+                            "last_update": current_time,
+                            "last_seen": current_time,
+                            "dwells": {current_phys_zone: 0.1},
+                            "phys_zone": current_phys_zone,
+                            "dom_zone": current_phys_zone,
+                            "dom_class": "crowd_1",
+                            "histogram": hist,
+                            "path": [(cx, cy)]
+                        }
+                        self.zone_stats[current_phys_zone]["current"] += 1
+                        self.zone_stats[current_phys_zone]["total"] += 1
+                        self.zone_stats[current_phys_zone]["crowd_1"] += 1
+
                 else:
+                    # --- Existing Track ---
                     track = self.track_history[track_id]
                     dt = current_time - track["last_update"]
                     track["last_update"] = current_time
@@ -282,6 +470,9 @@ class VideoCamera:
 
                     if len(track["path"]) > 45:
                         track["path"].pop(0)
+
+                    # Update appearance feature (EMA)
+                    track["histogram"] = self.reid.blend(track.get("histogram"), hist)
 
                     if track["phys_zone"] != current_phys_zone:
                         if track["phys_zone"] in self.zone_stats:
@@ -311,11 +502,18 @@ class VideoCamera:
                         if new_dom_zone != old_dom_zone:
                             self.zone_stats[new_dom_zone]["total"] += 1
 
-            # Cleanup lost tracks
+            # ----------------------------------------------------------
+            # Cleanup: lost tracks → save to ReID gallery (not InfluxDB yet)
+            # ----------------------------------------------------------
             ids_to_remove = []
             for track_id, track in self.track_history.items():
                 if current_time - track["last_seen"] > 3.0:
-                    self._write_total(track["dom_zone"], track["dom_class"])
+                    # Save appearance to gallery for future ReID matching.
+                    # InfluxDB write is deferred until the gallery entry expires.
+                    self.reid.save(
+                        track_id, track.get("histogram"),
+                        track, track["last_seen"]
+                    )
                     if track["phys_zone"] in self.zone_stats:
                         self.zone_stats[track["phys_zone"]]["current"] = max(0, self.zone_stats[track["phys_zone"]]["current"] - 1)
                     ids_to_remove.append(track_id)
@@ -323,11 +521,15 @@ class VideoCamera:
             for track_id in ids_to_remove:
                 del self.track_history[track_id]
 
+            # Flush expired gallery entries → finalize their InfluxDB records
+            for expired_track in self.reid.flush_expired(current_time):
+                self._write_total(expired_track["dom_zone"], expired_track["dom_class"])
+
         # --- End critical section ---
 
         # Draw overlays and encode JPEG only at throttled rate
         if should_render:
-            for track_id, (cx, cy, _, x1, y1, x2, y2) in current_frame_data.items():
+            for track_id, (cx, cy, _, x1, y1, x2, y2, _hist) in current_frame_data.items():
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(canvas, f"ID: {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.circle(canvas, (cx, cy), 6, (0, 0, 255), -1)
