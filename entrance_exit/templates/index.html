@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Directional Counter: Entry & Exit</title>
+    <style>
+        body { margin: 0; background-color: #1a1a1a; color: #ffffff; font-family: Arial, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+        .main-container { display: flex; width: 100%; padding: 20px; box-sizing: border-box; gap: 20px; }
+        .video-section { flex: 3; background-color: #000; border: 2px solid #333; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
+        .video-wrapper { position: relative; display: inline-block; width: 100%; height: auto; line-height: 0; }
+        #video-feed { width: 100%; height: auto; display: block; }
+        #drawing-canvas { position: absolute; top: 0; left: 0; z-index: 10; cursor: pointer; }
+        
+        .controls { padding: 15px; background-color: #2a2a2a; display: flex; gap: 10px; z-index: 20; align-items: center; flex-wrap: wrap; }
+        button, select { padding: 10px 15px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        select { background-color: #333; }
+        button.active { background-color: #2196F3; }
+        button.danger { background-color: #f44336; }
+        
+        .stats-section { flex: 1; background-color: #2a2a2a; border-radius: 8px; padding: 20px; display: flex; flex-direction: column; gap: 15px; justify-content: center;}
+        
+        /* Large IN / OUT Display */
+        .count-card { background-color: #1a1a1a; padding: 30px; border-radius: 8px; text-align: center;}
+        .card-in { border-bottom: 8px solid #4CAF50; }
+        .card-out { border-bottom: 8px solid #f44336; }
+        .count-title { margin: 0 0 10px 0; font-size: 24px; color: #aaa; text-transform: uppercase; letter-spacing: 2px;}
+        .count-val { font-size: 72px; font-weight: bold; margin: 0; }
+        .val-in { color: #4CAF50; }
+        .val-out { color: #f44336; }
+
+        /* Source Selection Modal */
+        #sourceModal {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background-color: rgba(0,0,0,0.95); z-index: 9999;
+            display: none; align-items: center; justify-content: center;
+        }
+        .source-card {
+            background-color: #2a2a2a; padding: 40px; border-radius: 12px;
+            text-align: center; width: 100%; max-width: 450px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .source-btn { width: 100%; padding: 15px; font-size: 18px; margin-bottom: 15px; }
+        .divider { display: flex; align-items: center; margin: 25px 0; color: #777; }
+        .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #444; }
+        .divider span { padding: 0 15px; }
+    </style>
+</head>
+<body>
+
+<!-- Setup Selection Modal -->
+<div id="sourceModal">
+    <div class="source-card">
+        <h2 style="color: #4CAF50; margin-top: 0;">Select Video Source</h2>
+        <p style="color: #aaa; margin-bottom: 30px;">Choose how to feed the video to the AI tracking system.</p>
+        
+        <button class="source-btn" onclick="selectRTSP()">Use Live CCTV (RTSP)</button>
+        
+        <div class="divider"><span>OR</span></div>
+        
+        <input type="file" id="videoFile" accept="video/mp4,video/avi,video/x-m4v" style="width: 100%; padding: 12px; background: #111; border: 1px solid #444; border-radius: 4px; margin-bottom: 15px; color: white; box-sizing: border-box;">
+        <button class="source-btn active" id="uploadBtn" onclick="uploadVideo()">Upload Pre-recorded Video</button>
+        
+        <p id="uploadStatus" style="color: #FFC107; display: none; margin-top: 15px; font-weight: bold;">Uploading and compiling AI... Please wait.</p>
+    </div>
+</div>
+
+<div class="main-container">
+    <div class="video-section">
+        <div class="video-wrapper">
+            <img id="video-feed" src="/video_feed" alt="Video Feed Waiting...">
+            <canvas id="drawing-canvas"></canvas>
+        </div>
+        <div class="controls">
+            <select id="zone-selector">
+                <option value="zone_a">Zone A (Inner)</option>
+                <option value="zone_b">Zone B (Outer)</option>
+            </select>
+            <button id="btn-draw" onclick="toggleDrawing()">Draw Selected Zone</button>
+            <button class="danger" onclick="clearCurrent()">Clear Current</button>
+            <button style="margin-left:auto;" onclick="saveConfig()">Save Settings</button>
+        </div>
+    </div>
+
+    <div class="stats-section">
+        <div class="count-card card-in">
+            <h3 class="count-title">Rule Breaker (IN)</h3>
+            <p style="margin:0; color:#666; font-size:12px;">Zone B &rarr; Zone A</p>
+            <div class="count-val val-in" id="val-in">0</div>
+        </div>
+        
+        <div class="count-card card-out">
+            <h3 class="count-title">Total Exit (OUT)</h3>
+            <p style="margin:0; color:#666; font-size:12px;">Zone A &rarr; Zone B</p>
+            <div class="count-val val-out" id="val-out">0</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- Initial Check: Have we picked a source? ---
+    fetch('/get_status').then(res => res.json()).then(data => {
+        if (!data.source_selected) {
+            document.getElementById('sourceModal').style.display = 'flex';
+        }
+    });
+
+    function selectRTSP() {
+        document.getElementById('uploadStatus').innerText = "Starting CCTV pipeline...";
+        document.getElementById('uploadStatus').style.display = 'block';
+        fetch('/set_source', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({type: 'rtsp'})
+        }).then(res => res.json()).then(data => {
+            if(data.status === "success") {
+                document.getElementById('sourceModal').style.display = 'none';
+                setTimeout(() => { document.getElementById('video-feed').src = "/video_feed?" + new Date().getTime(); }, 2000);
+            } else { alert(data.message); }
+        });
+    }
+
+    function uploadVideo() {
+        const fileInput = document.getElementById('videoFile');
+        if(!fileInput.files[0]) return alert('Please select a video file first!');
+        
+        document.getElementById('uploadBtn').disabled = true;
+        document.getElementById('uploadStatus').style.display = 'block';
+
+        const formData = new FormData();
+        formData.append('video', fileInput.files[0]);
+
+        fetch('/set_source', {
+            method: 'POST',
+            body: formData
+        }).then(res => res.json()).then(data => {
+            if(data.status === "success") {
+                document.getElementById('sourceModal').style.display = 'none';
+                setTimeout(() => { document.getElementById('video-feed').src = "/video_feed?" + new Date().getTime(); }, 2000);
+            } else { alert(data.message); }
+        });
+    }
+
+    // --- Standard Application Logic ---
+    const canvas = document.getElementById('drawing-canvas');
+    const ctx = canvas.getContext('2d');
+    const video = document.getElementById('video-feed');
+    const selector = document.getElementById('zone-selector');
+    
+    let isDrawing = false;
+    let zones = { zone_a: [], zone_b: [] };
+
+    function syncCanvasSize() {
+        if (video.clientWidth > 0 && video.clientHeight > 0) {
+            canvas.width = video.clientWidth;
+            canvas.height = video.clientHeight;
+            redraw();
+        }
+    }
+    video.addEventListener('load', syncCanvasSize);
+    window.addEventListener('resize', syncCanvasSize);
+
+    fetch('/get_config').then(res => res.json()).then(data => {
+        zones.zone_a = data.zone_a || [];
+        zones.zone_b = data.zone_b || [];
+        setTimeout(syncCanvasSize, 300);
+    });
+
+    function toggleDrawing() {
+        isDrawing = !isDrawing;
+        const btn = document.getElementById('btn-draw');
+        if (isDrawing) {
+            btn.classList.add('active');
+            btn.innerText = "Finish Drawing";
+            canvas.style.cursor = "crosshair";
+        } else {
+            btn.classList.remove('active');
+            btn.innerText = "Draw Selected Zone";
+            canvas.style.cursor = "pointer";
+        }
+    }
+
+    function clearCurrent() {
+        zones[selector.value] = [];
+        redraw();
+    }
+
+    canvas.addEventListener('click', (e) => {
+        if (!isDrawing) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.round((e.clientX - rect.left) / canvas.width * 1280);
+        const y = Math.round((e.clientY - rect.top) / canvas.height * 720);
+        
+        zones[selector.value].push([x, y]);
+        redraw();
+    });
+
+    function redraw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        const drawPoly = (pts, color, name) => {
+            if (pts.length === 0) return;
+            ctx.beginPath();
+            ctx.moveTo(pts[0][0] / 1280 * canvas.width, pts[0][1] / 720 * canvas.height);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0] / 1280 * canvas.width, pts[i][1] / 720 * canvas.height);
+            ctx.closePath();
+            ctx.fillStyle = color + '40';
+            ctx.fill();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            ctx.fillStyle = color;
+            ctx.font = "bold 16px Arial";
+            ctx.fillText(name, (pts[0][0] / 1280 * canvas.width), (pts[0][1] / 720 * canvas.height) - 8);
+        };
+
+        drawPoly(zones.zone_a, '#00A5FF', "Zone A");
+        drawPoly(zones.zone_b, '#FF00FF', "Zone B");
+    }
+
+    function saveConfig() {
+        fetch('/save_config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(zones)
+        })
+        .then(res => res.json())
+        .then(data => alert(data.message));
+    }
+
+    setInterval(() => {
+        fetch('/get_stats')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('val-in').innerText = data.in;
+                document.getElementById('val-out').innerText = data.out;
+            });
+    }, 1000);
+</script>
+</body>
+</html>
