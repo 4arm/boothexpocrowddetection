@@ -297,12 +297,12 @@
                     const card = `
                         <div class="zone-card" style="border-left-color: ${color};">
                             <h3 class="zone-title">${zoneName}</h3>
-                            <div class="stat-row"><span>Live People Inside:</span> <span class="stat-val highlight-val">${stats.current}</span></div>
-                            <div class="stat-row"><span>Total Unique IDs:</span> <span class="stat-val">${stats.total}</span></div>
+                            <div class="stat-row"><span>Live Customers:</span> <span class="stat-val highlight-val">${stats.current}</span></div>
+                            <div class="stat-row"><span>Staff in Zone:</span> <span class="stat-val" style="color: #FFA500;">${stats.staff || 0}</span></div>
+                            <div class="stat-row"><span>Total Unique Customers:</span> <span class="stat-val">${stats.total}</span></div>
                             <div class="stat-row" style="margin-top:10px;"><span>Crowd 1 (< 5s):</span> <span class="stat-val">${stats.crowd_1}</span></div>
                             <div class="stat-row"><span>Crowd 2 (5 - 15s):</span> <span class="stat-val">${stats.crowd_2}</span></div>
                             <div class="stat-row"><span>Crowd 3 (15s - 15m):</span> <span class="stat-val">${stats.crowd_3}</span></div>
-                            <div class="stat-row"><span>Crowd 4 (> 15m):</span> <span class="stat-val">${stats.crowd_4}</span></div>
                         </div>
                     `;
                     panel.innerHTML += card;
