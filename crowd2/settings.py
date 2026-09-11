@@ -12,6 +12,6 @@ INFLUX_TOKEN  = os.environ.get("INFLUX_TOKEN",  "7T_yxGlTGix-ytg4dkEB5Po_faLfDQ9
 INFLUX_ORG    = os.environ.get("INFLUX_ORG",    "MT")
 INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "booth")
 CAMERA_ID     = os.environ.get("CAMERA_ID",     "FarmBest")
-RTSP_URL      = os.environ.get("RTSP_URL",      "rtsp://admin:Mt10ma18@192.168.0.65:554/Streaming/channels/101")
+RTSP_URL      = os.environ.get("RTSP_URL",      "rtsp://admin:Mt10ma18@192.168.0.66:554/Streaming/channels/101")
 HEF_PATH      = os.environ.get("HEF_PATH",      "/home/pi/hailo-rpi5-examples/resources/models/hailo8/yolov8m_pose.hef")
 

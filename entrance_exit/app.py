@@ -24,7 +24,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 RTSP_URL = "rtsp://admin:Mt10ma18@192.168.0.65:554/Streaming/channels/101"
 HEF_PATH = "/home/pi/hailo-rpi5-examples/resources/models/hailo8/yolov8m_pose.hef"
 CAMERA_ID = "directional_1"
-CONFIDENCE = 0.3
+CONFIDENCE = 0.15
 FLASK_PORT = 5000
 
 INFLUX_URL = "http://localhost:8086"
@@ -191,7 +191,9 @@ class DirectionalApp(GStreamerPoseEstimationApp):
         pipeline = pipeline.replace("rtspsrc", "rtspsrc ntp-sync=true add-reference-timestamp-meta=true protocols=tcp latency=100")
         pipeline = pipeline.replace('caps="video/x-raw, framerate=30/1"', 'caps="video/x-raw"', 1)
         pipeline = pipeline.replace("video-sink=autovideosink", "video-sink=fakesink", 1)
-        pipeline = pipeline.replace("keep-new-frames=2 keep-tracked-frames=15 keep-lost-frames=2", "keep-new-frames=2 keep-tracked-frames=15 keep-lost-frames=10", 1)
+        pipeline = pipeline.replace("keep-lost-frames=2", "keep-lost-frames=30")
+        pipeline = pipeline.replace("iou-thr=0.9", "iou-thr=0.5")
+        pipeline = pipeline.replace("init-iou-thr=0.7", "init-iou-thr=0.5")
         return pipeline
 
 class UserData(app_callback_class):
@@ -227,27 +229,27 @@ def app_callback(pad, info, user_data):
         x1, y1 = int(bbox.xmin() * width), int(bbox.ymin() * height)
         x2, y2 = int((bbox.xmin() + bbox.width()) * width), int((bbox.ymin() + bbox.height()) * height)
         
+        test_points = [
+            (x1, y2),                  # Bottom Left
+            (int((x1 + x2) / 2), y2),  # Bottom Center
+            (x2, y2)                   # Bottom Right
+        ]
+        
         foot_x, foot_y = int((x1 + x2) / 2), y2
-        landmarks = det.get_objects_typed(hailo.HAILO_LANDMARKS)
-        if landmarks:
-            pts = landmarks[0].get_points()
-            if len(pts) >= 17:
-                la, ra = pts[15], pts[16]
-                visible = []
-                if la.confidence() < 0.3: visible.append((int(la.x() * width), int(la.y() * height)))
-                if ra.confidence() < 0.3: visible.append((int(ra.x() * width), int(ra.y() * height)))
-                if visible:
-                    foot_x = int(sum(p[0] for p in visible) / len(visible))
-                    foot_y = int(sum(p[1] for p in visible) / len(visible))
 
-        current_tracks[uid[0].get_id()] = (x1, y1, x2, y2, foot_x, foot_y)
+        current_tracks[uid[0].get_id()] = (x1, y1, x2, y2, foot_x, foot_y, test_points)
 
     with count_lock:
-        for tid, (x1, y1, x2, y2, foot_x, foot_y) in current_tracks.items():
+        for tid, (x1, y1, x2, y2, foot_x, foot_y, test_points) in current_tracks.items():
             curr_zone = None
-            if point_in_polygon((foot_x, foot_y), zone_a): curr_zone = "A"
-            elif point_in_polygon((foot_x, foot_y), zone_b): curr_zone = "B"
-
+            for pt in test_points:
+                if point_in_polygon(pt, zone_a): 
+                    curr_zone = "A"
+                    break
+                elif point_in_polygon(pt, zone_b): 
+                    curr_zone = "B"
+                    break
+            
             if tid not in track_state:
                 track_state[tid] = {
                     "history": [], 
@@ -299,7 +301,7 @@ def app_callback(pad, info, user_data):
     if frame is None: return Gst.PadProbeReturn.OK
     canvas = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    for tid, (x1, y1, x2, y2, foot_x, foot_y) in current_tracks.items():
+    for tid, (x1, y1, x2, y2, foot_x, foot_y, _) in current_tracks.items():
         state = track_state.get(tid, {})
         color = (0, 255, 0) if state.get("counted") else (0, 200, 255)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1)
