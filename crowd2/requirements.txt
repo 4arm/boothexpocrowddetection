@@ -1,0 +1,17 @@
+# Core runtime
+Flask>=3.0
+numpy>=1.26
+opencv-python>=4.10
+influxdb-client>=1.44
+
+# Model + config helpers
+ultralytics>=8.2
+PyYAML>=6.0
+
+# Legacy/utility script used in test.py
+shapely>=2.0
+
+# Note: this project also depends on system packages not available via pip:
+# - GStreamer 1.0 with GI bindings (gi / pygobject)
+# - Hailo runtime / Hailo Python SDK
+# - Raspberry Pi Hailo hardware support
